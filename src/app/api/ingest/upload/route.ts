@@ -9,11 +9,16 @@ import { chunkText } from "@/lib/rag/chunking";
 import { generateEmbeddings } from "@/lib/rag/embeddings";
 import { eq } from "drizzle-orm";
 
+// Allow up to 60s for file processing on Vercel
+export const maxDuration = 60;
+
 export async function POST(request: Request) {
   const session = await auth();
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
+
+  let sourceId: string | null = null;
 
   try {
     const formData = await request.formData();
@@ -48,98 +53,99 @@ export async function POST(request: Request) {
       })
       .returning({ id: sources.id });
 
-    // Process in background (non-blocking)
-    processFile(source.id, file, type).catch(async (err) => {
-      console.error("Ingestion failed:", err);
+    sourceId = source.id;
+
+    // Process file inline (Vercel kills background tasks)
+    const buffer = Buffer.from(await file.arrayBuffer());
+    let allChunks: ReturnType<typeof chunkText> = [];
+    let pageCount: number | null = null;
+    let metadata: Record<string, unknown> = {};
+
+    if (type === "pdf") {
+      const parsed = await parsePdf(buffer);
+      pageCount = parsed.pageCount;
+      metadata = parsed.metadata;
+      for (const page of parsed.pages) {
+        const pageChunks = chunkText(page.content, {
+          pageNumber: page.pageNumber,
+        });
+        allChunks.push(...pageChunks);
+      }
+    } else if (type === "txt") {
+      const text = buffer.toString("utf-8");
+      const parsed = parseTxt(text);
+      for (const section of parsed.sections) {
+        const sectionChunks = chunkText(section.content);
+        allChunks.push(...sectionChunks);
+      }
+    } else if (type === "docx") {
+      const parsed = await parseDocx(buffer);
+      metadata = parsed.metadata;
+      allChunks = chunkText(parsed.text);
+    }
+
+    if (allChunks.length === 0) {
       await db
         .update(sources)
         .set({ status: "failed" })
-        .where(eq(sources.id, source.id));
-    });
+        .where(eq(sources.id, sourceId));
+      return NextResponse.json(
+        { error: "No content could be extracted from the file" },
+        { status: 400 }
+      );
+    }
 
-    return NextResponse.json({ sourceId: source.id });
+    // Re-index chunks
+    allChunks = allChunks.map((c, i) => ({ ...c, index: i }));
+
+    // Generate embeddings in batches of 50
+    const batchSize = 50;
+    for (let i = 0; i < allChunks.length; i += batchSize) {
+      const batch = allChunks.slice(i, i + batchSize);
+      const texts = batch.map((c) => c.content);
+      const embeddings = await generateEmbeddings(texts);
+
+      const values = batch.map((chunk, j) => ({
+        sourceId,
+        content: chunk.content,
+        embedding: embeddings[j],
+        pageNumber: chunk.pageNumber,
+        chapter: chunk.chapter,
+        section: chunk.section,
+        chunkIndex: chunk.index,
+        url: chunk.url,
+      }));
+
+      await db.insert(chunks).values(values);
+    }
+
+    // Update source to ready
+    await db
+      .update(sources)
+      .set({
+        status: "ready",
+        pageCount,
+        metadata,
+        updatedAt: new Date(),
+      })
+      .where(eq(sources.id, sourceId));
+
+    return NextResponse.json({ sourceId });
   } catch (err) {
     console.error("Upload error:", err);
+
+    // Mark as failed if source was created
+    if (sourceId) {
+      await db
+        .update(sources)
+        .set({ status: "failed" })
+        .where(eq(sources.id, sourceId))
+        .catch(() => {});
+    }
+
     return NextResponse.json(
-      { error: "Upload failed" },
+      { error: err instanceof Error ? err.message : "Upload failed" },
       { status: 500 }
     );
   }
-}
-
-async function processFile(
-  sourceId: string,
-  file: File,
-  type: "pdf" | "txt" | "docx"
-) {
-  const buffer = Buffer.from(await file.arrayBuffer());
-  let allChunks: ReturnType<typeof chunkText> = [];
-  let pageCount: number | null = null;
-  let metadata: Record<string, unknown> = {};
-
-  if (type === "pdf") {
-    const parsed = await parsePdf(buffer);
-    pageCount = parsed.pageCount;
-    metadata = parsed.metadata;
-    for (const page of parsed.pages) {
-      const pageChunks = chunkText(page.content, {
-        pageNumber: page.pageNumber,
-      });
-      allChunks.push(...pageChunks);
-    }
-  } else if (type === "txt") {
-    const text = buffer.toString("utf-8");
-    const parsed = parseTxt(text);
-    for (const section of parsed.sections) {
-      const sectionChunks = chunkText(section.content);
-      allChunks.push(...sectionChunks);
-    }
-  } else if (type === "docx") {
-    const parsed = await parseDocx(buffer);
-    metadata = parsed.metadata;
-    allChunks = chunkText(parsed.text);
-  }
-
-  if (allChunks.length === 0) {
-    await db
-      .update(sources)
-      .set({ status: "failed" })
-      .where(eq(sources.id, sourceId));
-    return;
-  }
-
-  // Re-index chunks
-  allChunks = allChunks.map((c, i) => ({ ...c, index: i }));
-
-  // Generate embeddings in batches of 50
-  const batchSize = 50;
-  for (let i = 0; i < allChunks.length; i += batchSize) {
-    const batch = allChunks.slice(i, i + batchSize);
-    const texts = batch.map((c) => c.content);
-    const embeddings = await generateEmbeddings(texts);
-
-    const values = batch.map((chunk, j) => ({
-      sourceId,
-      content: chunk.content,
-      embedding: embeddings[j],
-      pageNumber: chunk.pageNumber,
-      chapter: chunk.chapter,
-      section: chunk.section,
-      chunkIndex: chunk.index,
-      url: chunk.url,
-    }));
-
-    await db.insert(chunks).values(values);
-  }
-
-  // Update source to ready
-  await db
-    .update(sources)
-    .set({
-      status: "ready",
-      pageCount,
-      metadata,
-      updatedAt: new Date(),
-    })
-    .where(eq(sources.id, sourceId));
 }

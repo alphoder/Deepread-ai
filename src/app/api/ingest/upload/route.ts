@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { db } from "@/lib/db";
-import { sources, chunks } from "@/lib/db/schema";
+import { sources } from "@/lib/db/schema";
 import { parsePdf } from "@/lib/ingest/pdf-loader";
 import { parseTxt } from "@/lib/ingest/txt-loader";
 import { parseDocx } from "@/lib/ingest/docx-loader";
@@ -10,8 +10,8 @@ import { parallelIngest } from "@/lib/rag/parallel-ingest";
 import { eq } from "drizzle-orm";
 
 export const maxDuration = 60;
+export const runtime = "nodejs";
 
-// Limit body size to 10MB
 export async function POST(request: Request) {
   const session = await auth();
   if (!session?.user?.id) {
@@ -21,18 +21,23 @@ export async function POST(request: Request) {
   let sourceId: string | null = null;
 
   try {
-    const body = await request.json();
-    const { fileName, fileSize, fileData } = body;
-
-    if (!fileName || !fileData) {
+    // Parse multipart form data
+    let file: File | null = null;
+    try {
+      const formData = await request.formData();
+      file = formData.get("file") as File | null;
+    } catch {
       return NextResponse.json(
-        { error: "File name and data are required" },
+        { error: "Could not read file. Make sure it is under 10MB." },
         { status: 400 }
       );
     }
 
-    // Check file size (10MB limit for Vercel)
-    if (fileSize > 10 * 1024 * 1024) {
+    if (!file) {
+      return NextResponse.json({ error: "No file provided" }, { status: 400 });
+    }
+
+    if (file.size > 10 * 1024 * 1024) {
       return NextResponse.json(
         { error: "File must be under 10MB" },
         { status: 400 }
@@ -40,7 +45,7 @@ export async function POST(request: Request) {
     }
 
     // Determine file type
-    const name = fileName.toLowerCase();
+    const name = file.name.toLowerCase();
     let type: "pdf" | "txt" | "docx";
     if (name.endsWith(".pdf")) type = "pdf";
     else if (name.endsWith(".txt")) type = "txt";
@@ -52,15 +57,15 @@ export async function POST(request: Request) {
       );
     }
 
-    // Decode base64 to buffer
-    const buffer = Buffer.from(fileData, "base64");
+    // Read file into buffer
+    const buffer = Buffer.from(await file.arrayBuffer());
 
     // Create source record
     const [source] = await db
       .insert(sources)
       .values({
         userId: session.user.id,
-        title: fileName.replace(/\.[^/.]+$/, ""),
+        title: file.name.replace(/\.[^/.]+$/, ""),
         type,
         fileSize: buffer.length,
         status: "processing",
@@ -108,11 +113,11 @@ export async function POST(request: Request) {
       );
     }
 
-    // Re-index and limit chunks to prevent OOM
+    // Re-index and limit chunks
     allChunks = allChunks.slice(0, 300).map((c, i) => ({ ...c, index: i }));
 
-    // Split into 3 parallel workers for embedding + insertion
-    await parallelIngest(sourceId!, allChunks);
+    // 3 parallel workers for embedding + insertion
+    await parallelIngest(sourceId, allChunks);
 
     // Update source to ready
     await db

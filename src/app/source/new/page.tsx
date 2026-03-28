@@ -78,22 +78,12 @@ export default function NewSourcePage() {
     setLoading(true);
     setError(null);
     try {
-      // Send as base64 JSON to avoid Vercel FormData/multipart issues
-      const arrayBuffer = await file.arrayBuffer();
-      const base64 = btoa(
-        new Uint8Array(arrayBuffer).reduce(
-          (data, byte) => data + String.fromCharCode(byte),
-          ""
-        )
-      );
+      const formData = new FormData();
+      formData.append("file", file);
+      // Don't set Content-Type header — browser adds it with boundary
       const res = await fetch("/api/ingest/upload", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          fileName: file.name,
-          fileSize: file.size,
-          fileData: base64,
-        }),
+        body: formData,
       });
       if (!res.ok) {
         const contentType = res.headers.get("content-type") || "";

@@ -85,8 +85,12 @@ export default function NewSourcePage() {
         body: formData,
       });
       if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.error || "Upload failed");
+        const contentType = res.headers.get("content-type") || "";
+        if (contentType.includes("application/json")) {
+          const data = await res.json();
+          throw new Error(data.error || "Upload failed");
+        }
+        throw new Error(`Upload failed (${res.status})`);
       }
       const data = await res.json();
       router.push(`/source/${data.sourceId}`);
@@ -108,8 +112,12 @@ export default function NewSourcePage() {
         body: JSON.stringify({ url: url.trim() }),
       });
       if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.error || "Scraping failed");
+        const contentType = res.headers.get("content-type") || "";
+        if (contentType.includes("application/json")) {
+          const data = await res.json();
+          throw new Error(data.error || "Scraping failed");
+        }
+        throw new Error(`Failed to add URL (${res.status})`);
       }
       const data = await res.json();
       router.push(`/source/${data.sourceId}`);

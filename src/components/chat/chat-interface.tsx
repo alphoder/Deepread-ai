@@ -49,8 +49,12 @@ export function ChatInterface({ sourceId }: { sourceId: string }) {
       });
 
       if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.error || "Failed to get response");
+        const contentType = res.headers.get("content-type") || "";
+        if (contentType.includes("application/json")) {
+          const data = await res.json();
+          throw new Error(data.error || "Failed to get response");
+        }
+        throw new Error(`Server error (${res.status}). Please try again.`);
       }
 
       // Get conversation ID from header

@@ -37,8 +37,11 @@ export default function DashboardPage() {
     try {
       const res = await fetch("/api/sources");
       if (res.ok) {
-        const data = await res.json();
-        setSources(data);
+        const contentType = res.headers.get("content-type") || "";
+        if (contentType.includes("application/json")) {
+          const data = await res.json();
+          setSources(data);
+        }
       }
     } catch (err) {
       console.error("Failed to fetch sources:", err);

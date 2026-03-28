@@ -4,7 +4,7 @@ import { db } from "@/lib/db";
 import { sources, chunks } from "@/lib/db/schema";
 import { scrapeUrl, ScrapeError } from "@/lib/ingest/web-scraper";
 import { chunkText } from "@/lib/rag/chunking";
-import { generateEmbeddings } from "@/lib/rag/embeddings";
+import { parallelIngest } from "@/lib/rag/parallel-ingest";
 import { eq } from "drizzle-orm";
 
 export const maxDuration = 60;
@@ -66,28 +66,12 @@ export async function POST(request: Request) {
       );
     }
 
-    const allChunks = chunkText(scraped.content, { url: scraped.url });
+    const allChunks = chunkText(scraped.content, { url: scraped.url })
+      .slice(0, 300)
+      .map((c, i) => ({ ...c, index: i }));
 
-    // Generate embeddings in batches
-    const batchSize = 50;
-    for (let i = 0; i < allChunks.length; i += batchSize) {
-      const batch = allChunks.slice(i, i + batchSize);
-      const texts = batch.map((c) => c.content);
-      const embeddings = await generateEmbeddings(texts);
-
-      const values = batch.map((chunk, j) => ({
-        sourceId: sourceId!,
-        content: chunk.content,
-        embedding: embeddings[j],
-        pageNumber: chunk.pageNumber,
-        chapter: chunk.chapter,
-        section: chunk.section,
-        chunkIndex: chunk.index,
-        url: chunk.url,
-      }));
-
-      await db.insert(chunks).values(values);
-    }
+    // Split into 3 parallel workers for embedding + insertion
+    await parallelIngest(sourceId!, allChunks);
 
     // Update source
     await db
